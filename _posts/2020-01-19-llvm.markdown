@@ -1,0 +1,45 @@
+---
+layout: post
+title:  "Parsing whole projects using LLVM"
+date:   2020-01-19 09:42:41 +0100
+categories: llvm osmocom compilers
+---
+The osmocom CNI (Cellular Network Infrastructure) has grown quite a bit, and has now reached a point at which keeping the user manuals in sync with the code is somewhat cumbersome and error prone. It's easy to miss configuration options, because they are split between various libraries (libosmocore, libosmo-abis, ...) and the applications (such as OsmoBTS). While it would be possible to _just_ parse the binaries, using the embedded dwarf debug information, that approach is fairly cumbersome if you want to extract data structures or reason about callers and callees, the compiled code is definitely harder to work with than llvm bitcode or the source code.
+
+LLVM to the rescue!
+Well, at least in theory. Using LLVM/Clang to parse the code is the obvious approach, but in practice it's unfortunately a bit more complicated. If your project is single application that is built by calling make you could just create a compilation database (compile_commands.json) either by reyling upon a modern build system like cmake, or a tool like **bear**, and then interact with the AST (Abstract Syntax Tree). For applications that use statically linked libraries this is slightly more complicated, because you need to parse the libary code as well, but only the parts that end up in the binary. The file names and paths, `DW_AT_comp_dir` and `DW_AT_name`, can be extracted from the dwarf debug information. The binary contains that information for all the used static libraries, too, and and it can be used to look up the compilation options from the compilation database. This does only work if unused functions/code is stripped, but `-ffunction-sections` and `-Wl,-gc-sections` should be fairly common.
+
+Shared libraries however make it worse. ldd can obviously tell you which libraries are used, but in order to figure out which _parts_ of those libraries are used you'd have to parse the ELF's `.dynamic`/`.dynsim` section (or the IAT for PE on Windows) and then go through the libraries and use the dwarf debug info for the shared lib to figure out to which source file that symbol belongs to, and then use that to deal with the compilation database. Meh.
+
+The CNI consists of a bunch of binaries and quite a few static and shared libs, seasoned with arcane build tools that have not been maintained since 2015 (i'm looking at you, libtool, you god damn piece of &%$!, why is there no newer release and lld/clang has to add workarounds?) that build tests and other stuff as well, so there are no nice subtargets available and libtool makes it impossible to just modify some compiler flags for a few files. Replacing the build system would make everything easier, but a less intrusive option would be preferable.
+
+A pure source code based approach would be to lazily construct the AST of the whole application code, including all the libaries, so you end up with a complete AST that only includes the used parts of the code.
+This means you'd need to cross translation unit boundaries and follow the calls until you end up with the code that is actually used - basically a linking step, but at the AST level. AST merging is used by LLDB at a much smaller scale, and it's what is required to use the (clang) static analyzer to analyze issues that cross translation unit boundaries, which can be rephrased as "support analyzing whole programs" at once. A first, stale version apparently conceived at Samsung was posted in [2015](http://lists.llvm.org/pipermail/cfe-dev/2015-October/045730.html) and a newer version appears to be maintained by [Ericsson](https://github.com/dkrupp/clang/tree/ctu-master). Unfortunately none of those patchsets are quite ready for prime time, the latter one doesn't support c++ and appears to break when confronted with the CNI, the first one is just too old. At the end of the day the issue boils down to "find the calls to register config options that are actually used", so trying to merge and traverse the whole AST is probably a bit too much work anyway.
+
+
+So the most convenient solution would be to link statically, adjusting optimizations such as inlining to make sure none of our function calls get inlined or in some other way obfuscated while still getting rid of unused code that might contain config options, then look up the debug information for those calls, then use that to use the compilation database to parse the corresponding source code.
+
+Just replacing gcc with clang and using `-emit-llvm` breaks the build all over the place, so that is not an option. Fortunately apple is using llvm, and xcode started embedding bitcode into their mach-o to support rewriting for new achitectures (even thogh the bitcode is target specific, arm is also rewriting armv7k IR to arm64_32). Adding `-fembed-bitcode` is enough to make this work, you end up with a `.llvmbc` section that contains the bitcode. There is also a fairly useless `.llvmcmd` section, gcc can embed the command line with `-frecord-gcc-switches`, too, which ends up in the `.GCC.command.line` section, but both suffer from libtool wrappers, and the compilation database is more useful anyway. The `.llvmbc` section survives linking, so a shared object contains all bitcode files, because those sections get merged - and padded due to alignment. This does not sound like a big deal, but since llvm bitcode files are streams that could just continue indefinitely merely extracting the whole section and splitting it at the bitcode magic `0x4243c0de` is not sufficient, the additional zero padding at the end must be removed. If **llvm-bcanalyzer** doesn't complain the files should be fine, and they can be linked into one large bitcode file using **llvm-link**.
+
+The resulting file can be optimized by using llvm's **opt** tool. The usual optimization steps would be to internalize (as in "not externally visible") all symbols, the only exception being the main function as entry point, to allow function inlining and the removal of unused functions. The advantage of manually calling the opt tool is that all optimization steps can be hand picked, so it is possible to exclude the functions related to registering config file options to ensure that they stay visible and then run dead code elimination to remove superfluous code that might contain unused config options.
+
+Parsing the bitcode using the libs provided by llvm is straightforward, calls can be found by iterating through all instructions of all basic blocks of all functions of all modules looking for `CallInst` and `InvokeInst`, followed by looking up the debug information for that specific instruction to figure out the source file and line.
+
+Armed with this information all that is left to do is to parse the AST with LibTooling by looking up the source file in the compilation database (or rather, the merged one consisting of all databases of all applications and libraries) to get the proper compiler flags.
+Matching AST nodes is fairly straightforward, even though what the compiler sees and what a human sees differs a lot the source code can just be inspected with **clang-query** using `enable output detailed-ast` as well as `set output diag`/`dump` until the proper patterns emerge.
+
+So to sum up the story so far:
+1. embed the bitcode
+2. extract the .llvmbc section from the .so/elf/whatever that contains all the bitcode files
+3. split it
+4. remove the padding at the end
+5. use llvm-link to link it into a proper single bitcode blob
+6. repeat those steps for all libs
+7. use ldd to grab the shared lib deps so you know which bitcode libs to use
+8. link the app with all the other lib bitcode files to get one bitcode file that contains everything (minus external libs)
+9. `opt -internalize -internalize-public-api-list=main,foocall,barcall,bazcall -globaldce`
+10. find interesting calls in the bitcode file and their origin
+11. use LibTooling/clang-query to deal with the AST
+
+This approach does not require modifications of the build system, but it will run into issues if there are duplicate entries in the compilation databases, duplicate symbols, or a fixed libary link order, and it requires tracking the library dependencies, which fortunately don't change very often. As a bonus you get staticallly linked appliations that do not suffer from the negative consequeces of `-fdata-sections` on ARM (due to the pc-relative literal pools).
+
